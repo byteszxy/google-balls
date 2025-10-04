@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>google balls by fenomenodev</title>
+<style>
+  :root {
+    --floor-height: 40px; /* invisible floor height used for collisions */
+  }
+
+  html,body {
+    height: 100%;
+    margin: 0;
+    background: white;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Scene container (keeps everything positioned) */
+  .scene {
+    position: relative;
+    width: 100%;
+    height: 100%;
+  }
+
+  /* Balls */
+  .ball {
+    position: absolute;
+    border-radius: 50%;
+    cursor: grab;
+    touch-action: none;          /* prevent page scrolling while dragging on touch */
+    transform-origin: 50% 50%;   /* rotate around center */
+    will-change: left, top, transform;
+    user-select: none;
+    box-shadow:
+      0 10px 20px rgba(0,0,0,0.12),
+      inset -18px -18px 40px rgba(0,0,0,0.18);
+    display: block;
+  }
+
+  /* Sizes + initial placement roughly matching the image */
+  .green  { width: 80px;  height: 80px;  background:#1abc9c;  left: 10%; top: 10%;  z-index: 1; }
+  .yellow { width: 130px; height: 130px; background:#f1c40f;  left: 25%; top: 30%;  z-index: 2; }
+  .red    { width: 160px; height: 160px; background:#e74c3c;  left: 45%; top: 45%;  z-index: 3; }
+  .blue   { width: 220px; height: 220px; background:#3498db;  left: 65%; top: 60%;  z-index: 4; }
+
+  /* Optional: tiny visual marker where the invisible floor sits (comment out if you don't want it even briefly) */
+  /* .floor-marker { position:absolute; left:0; right:0; height:var(--floor-height); bottom:0; pointer-events:none; } */
+</style>
+</head>
+<body>
+  <div class="scene">
+    <div class="ball green"></div>
+    <div class="ball yellow"></div>
+    <div class="ball red"></div>
+    <div class="ball blue"></div>
+
+    <!-- floor is invisible; collisions still use its height -->
+    <!-- <div class="floor-marker"></div> -->
+  </div>
+
+<script>
+(() => {
+  // Physics constants (tweak to taste)
+  const FLOOR_HEIGHT = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--floor-height')) || 40;
+  const GRAVITY = 0.98;        // px per frame^2
+  const BOUNCE = 0.75;         // velocity retained (0..1) on bounce
+  const AIR_FRICTION = 0.995;  // reduces vx, vy each frame
+  const GROUND_FRICTION = 0.985; // stronger friction when on floor
+  const FPS = 60;
+  const RAD_TO_DEG = 180 / Math.PI;
+
+  const scene = document.querySelector('.scene');
+  const ballEls = Array.from(document.querySelectorAll('.ball'));
+  const balls = [];
+
+  // Initialize ball objects and convert any percentage top/left into absolute px so we can
+  // control them with left/top reliably (avoids double-transform bugs).
+  ballEls.forEach((el, i) => {
+    const rect = el.getBoundingClientRect();
+
+    // set inline left/top to px (override percentage CSS)
+    el.style.left = `${rect.left}px`;
+    el.style.top  = `${rect.top}px`;
+
+    // remove any transform initially
+    el.style.transform = 'rotate(0deg)';
+
+    const diameter = rect.width;
+    const ball = {
+      el,
+      width: diameter,
+      height: diameter,
+      radius: diameter / 2,
+      x: rect.left,
+      y: rect.top,
+      vx: 0,
+      vy: 0,
+      angle: 0,                // degrees
+      isDragging: false,
+      pointerId: null,
+      offsetX: 0,
+      offsetY: 0,
+      samples: []              // recent pointer samples for velocity calc
+    };
+
+    balls.push(ball);
+
+    // pointerdown to start drag (works for mouse/touch/pen)
+    el.addEventListener('pointerdown', (ev) => {
+      ev.preventDefault();
+      startDrag(ball, ev);
+    });
+  });
+
+  // Start dragging a given ball
+  function startDrag(ball, ev) {
+    ball.isDragging = true;
+    ball.pointerId = ev.pointerId;
+    ball.offsetX = ev.clientX - ball.x;
+    ball.offsetY = ev.clientY - ball.y;
+    ball.vx = 0;
+    ball.vy = 0;
+    ball.samples = [{ t: performance.now(), x: ev.clientX, y: ev.clientY }];
+    ball.el.setPointerCapture(ev.pointerId);
+    ball.el.style.zIndex = 1000;                // bring to front while dragging
+    ball.el.style.cursor = 'grabbing';
+  }
+
+  // Global pointermove handler
+  window.addEventListener('pointermove', (ev) => {
+    const b = balls.find(b => b.isDragging && b.pointerId === ev.pointerId);
+    if (!b) return;
+    ev.preventDefault();
+
+    // update position
+    const prevX = b.x;
+    b.x = ev.clientX - b.offsetX;
+    b.y = ev.clientY - b.offsetY;
+
+    // clamp so dragging doesn't place them permanently outside the viewport
+    clampBallIntoViewport(b);
+
+    // update rotation based on horizontal drag displacement (gives visible rolling while dragging)
+    const dx = b.x - prevX;
+    b.angle += (dx / b.radius) * RAD_TO_DEG;
+
+    // update DOM
+    b.el.style.left = `${b.x}px`;
+    b.el.style.top = `${b.y}px`;
+    b.el.style.transform = `rotate(${b.angle}deg)`;
+
+    // record sample for later velocity calc (keep recent few)
+    const now = performance.now();
+    b.samples.push({ t: now, x: ev.clientX, y: ev.clientY });
+    while (b.samples.length > 6) b.samples.shift();
+  }, { passive: false });
+
+  // Global pointerup handler
+  window.addEventListener('pointerup', (ev) => {
+    const b = balls.find(b => b.isDragging && b.pointerId === ev.pointerId);
+    if (!b) return;
+    ev.preventDefault();
+
+    // compute velocity from last samples (look for a sample 40-120ms before the last)
+    const now = performance.now();
+    const last = b.samples[b.samples.length - 1];
+    let earlier = null;
+    for (let i = b.samples.length - 2; i >= 0; i--) {
+      const s = b.samples[i];
+      if (last.t - s.t >= 30) { earlier = s; break; }
+    }
+    // fallback to the first sample if none old enough
+    if (!earlier) earlier = b.samples[0];
+
+    const dt = Math.max(1, last.t - earlier.t); // ms
+    const dx = last.x - earlier.x;
+    const dy = last.y - earlier.y;
+
+    // convert to px per second, then to px per frame (approx 60fps)
+    const vx_per_sec = (dx * 1000) / dt;
+    const vy_per_sec = (dy * 1000) / dt;
+    b.vx = vx_per_sec / FPS;
+    b.vy = vy_per_sec / FPS;
+
+    // release pointer capture and finish drag
+    try { b.el.releasePointerCapture(ev.pointerId); } catch(e){}
+    b.isDragging = false;
+    b.pointerId = null;
+    b.offsetX = 0;
+    b.offsetY = 0;
+    b.samples = [];
+    b.el.style.zIndex = '';        // restore stacking
+    b.el.style.cursor = 'grab';
+  }, { passive: false });
+
+  // Keep balls inside viewport after resizes
+  window.addEventListener('resize', () => {
+    balls.forEach(clampBallIntoViewport);
+  });
+
+  function clampBallIntoViewport(b) {
+    const maxX = window.innerWidth - b.width;
+    const maxY = window.innerHeight - b.height - FLOOR_HEIGHT; // respect invisible floor
+    if (b.x < 0) b.x = 0;
+    if (b.x > maxX) b.x = maxX;
+    if (b.y < 0) b.y = 0;
+    if (b.y > maxY) b.y = maxY;
+  }
+
+  // Animation loop
+  function animate() {
+    balls.forEach(b => {
+      if (b.isDragging) {
+        // already updated by pointermove; skip physics
+        return;
+      }
+
+      // physics
+      b.vy += GRAVITY;          // gravity per frame
+      b.x += b.vx;
+      b.y += b.vy;
+
+      // floor collision (invisible floor)
+      const floorY = window.innerHeight - FLOOR_HEIGHT - b.height;
+      if (b.y > floorY) {
+        b.y = floorY;
+        // bounce (invert vertical velocity)
+        if (Math.abs(b.vy) > 1) {
+          b.vy = -b.vy * BOUNCE;
+        } else {
+          // if very slow, stop vertical movement to avoid jitter
+          b.vy = 0;
+        }
+        // on ground -> extra friction
+        b.vx *= GROUND_FRICTION;
+      } else {
+        // in air -> slight air friction
+        b.vx *= AIR_FRICTION;
+        b.vy *= AIR_FRICTION;
+      }
+
+      // ceiling
+      if (b.y < 0) {
+        b.y = 0;
+        b.vy = -b.vy * BOUNCE;
+      }
+
+      // walls
+      const maxX = window.innerWidth - b.width;
+      if (b.x < 0) {
+        b.x = 0;
+        b.vx = -b.vx * BOUNCE;
+      } else if (b.x > maxX) {
+        b.x = maxX;
+        b.vx = -b.vx * BOUNCE;
+      }
+
+      // accumulate rotation by linear displacement (rolling without slipping)
+      // dx per frame = b.vx; angle delta (deg) = (dx / radius) * (180/pi)
+      b.angle += (b.vx / Math.max(1, b.radius)) * RAD_TO_DEG;
+
+      // clamp tiny velocities to zero to avoid infinite micro-oscillation
+      if (Math.abs(b.vx) < 0.001) b.vx = 0;
+      if (Math.abs(b.vy) < 0.001) b.vy = 0;
+
+      // write to DOM
+      b.el.style.left = `${b.x}px`;
+      b.el.style.top  = `${b.y}px`;
+      b.el.style.transform = `rotate(${b.angle}deg)`;
+    });
+
+    requestAnimationFrame(animate);
+  }
+
+  // start loop
+  requestAnimationFrame(animate);
+})();
+</script>
+</body>
+</html>
+  
